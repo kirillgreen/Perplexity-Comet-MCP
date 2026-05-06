@@ -39,11 +39,12 @@ Verify the Comet MCP is loaded in this session:
 2. Call `mcp__comet__comet_connect`. Expected: `Connected to Perplexity (target=sidecar)`. If it says `target=main`, the MCP is registered without `COMET_TARGET=sidecar` env var — inform the user and stop.
 3. Tell the user: "I'll send a structured prompt to Comet's agent. When the 'Let Assistant control your browser?' dialog pops up in the Comet window (port 9223), click **Allow once**. The agent then runs autonomously and reports back."
 
-## The three templates
+## The four templates
 
 Each template has its own reference file. Read the one that matches the user's request:
 
 - **Admin panel pilot** (`references/pilot-admin-panel.md`) — drafts a step plan first, gets your OK on risky steps, then executes. Use when the task involves changing settings, creating resources, sending things, or modifying others' data.
+- **Admin panel audit** (`references/audit-admin-panel.md`) — read-only inventory of all items in an admin panel (Loops workflows, Stripe products, Webflow pages, Notion DBs, etc.) with per-item structured records + cross-cutting observations. No checkpoints, no execute phase. Use when the user wants to know "what's configured in my X account".
 - **UX walkthrough** (`references/ux-walkthrough.md`) — single-shot exploration as a persona. No checkpoints, no risky actions (read-only journey). Use for "find the friction" tasks.
 - **Post-deploy smoke** (`references/post-deploy-smoke.md`) — single-shot verification against an explicit assertion list. Returns PASS/FAIL/UNKNOWN per assertion + screenshots on failure. Use after deploys.
 
@@ -104,6 +105,7 @@ Default to **show plan first, ask once, then execute** unless the user explicitl
 Read the one that matches the user's request:
 
 - `references/pilot-admin-panel.md` — multi-step admin task with plan→approve→execute loop
+- `references/audit-admin-panel.md` — read-only inventory with per-item records + cross-cutting observations
 - `references/ux-walkthrough.md` — persona-driven friction-finding journey
 - `references/post-deploy-smoke.md` — assertion-list verification with PASS/FAIL/UNKNOWN per item
 

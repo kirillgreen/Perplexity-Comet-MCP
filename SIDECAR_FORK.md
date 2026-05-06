@@ -96,6 +96,7 @@ When a new upstream release lands:
 - **Sidecar tab must exist or be creatable.** First `comet_connect` after a fresh Comet install will need the user to dismiss Comet's onboarding screen once.
 - **Cross-tab actions are handled by Comet itself** — what happens after a prompt submission depends on Comet's Assistant agent. The MCP only ferries the prompt and reads back the visible response.
 - **Profile is separate from user's main Comet.** MCP launches Comet on debug port 9223, which is a different profile from the user's daily browser. Login to Perplexity Pro is required once per profile.
+- **Mid-task progress steps don't render in `comet_poll` (deferred).** The body-text keyword scanner for step labels (`Navigating`, `Reading`, `Clicking`, etc.) doesn't catch sidecar's actual step-card structure — those cards live in React-rendered DOM with classes that need a more careful probe pass to map. Current behaviour: `steps[]` returns empty during work, `comet_poll` shows just `Status: WORKING` without per-step detail. Workaround: `comet_screenshot` shows the agent's progress cards visually. The step extraction code is in `getSidecarStatus` and is a no-op fallback rather than a regression — main response detection is unaffected.
 
 ## v2.6.2-sidecar.2 — fixes from production smoke test
 
