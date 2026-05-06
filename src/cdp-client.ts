@@ -14,6 +14,7 @@ import type {
   CometState,
   TabContext,
 } from "./types.js";
+import { TARGET, TARGET_URL, isTargetUrl, pickTargetTab } from "./target.js";
 
 // Detect if running in WSL (must be before windowsFetch)
 function isWSL(): boolean {
@@ -350,9 +351,10 @@ export class CometCDPClient {
       } catch { /* target gone */ }
     }
 
-    // Find best target
+    // Find best target — prefer current TARGET (main or sidecar)
     const targets = await this.listTargets();
-    const target = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai')) ||
+    const target = targets.find(t => t.type === 'page' && isTargetUrl(t.url)) ||
+                   targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai')) ||
                    targets.find(t => t.type === 'page' && t.url !== 'about:blank');
 
     if (target) {
@@ -400,12 +402,12 @@ export class CometCDPClient {
   }
 
   /**
-   * Ensure we're connected to the main Perplexity tab
-   * Used during agentic browsing when Comet may open new tabs
+   * Ensure we're connected to the active target tab (main or sidecar per COMET_TARGET).
+   * Method name preserved for upstream rebase ergonomics — internally target-aware.
    */
   async ensureOnPerplexityTab(): Promise<boolean> {
     try {
-      // First check if current connection is valid and on Perplexity
+      // Already on the right target?
       if (this.client) {
         try {
           const urlResult = await this.client.Runtime.evaluate({
@@ -413,30 +415,28 @@ export class CometCDPClient {
             timeout: 2000
           });
           const currentUrl = urlResult.result.value as string;
-          if (currentUrl?.includes('perplexity.ai')) {
-            return true; // Already on Perplexity tab
+          if (isTargetUrl(currentUrl)) {
+            return true;
           }
         } catch {
           // Current connection is stale, continue to reconnect
         }
       }
 
-      // Find and connect to Perplexity main tab
+      // Find and connect to the right tab
       const tabs = await this.listTabsCategorized();
-      if (tabs.main) {
-        await this.connect(tabs.main.id);
+      const targetTab = pickTargetTab(tabs);
+      if (targetTab) {
+        await this.connect(targetTab.id);
         this.invalidateHealthCache();
         return true;
       }
 
-      // Fallback: find any Perplexity tab
+      // Fallback: any tab matching the target URL pattern
       const targets = await this.listTargets();
-      const perplexityTab = targets.find(t =>
-        t.type === 'page' && t.url.includes('perplexity.ai')
-      );
-
-      if (perplexityTab) {
-        await this.connect(perplexityTab.id);
+      const matchingTab = targets.find(t => t.type === 'page' && isTargetUrl(t.url));
+      if (matchingTab) {
+        await this.connect(matchingTab.id);
         this.invalidateHealthCache();
         return true;
       }
@@ -448,7 +448,7 @@ export class CometCDPClient {
   }
 
   /**
-   * Check if we're currently connected to the Perplexity tab
+   * Check if we're connected to the active target tab.
    */
   async isOnPerplexityTab(): Promise<boolean> {
     if (!this.client) return false;
@@ -458,10 +458,102 @@ export class CometCDPClient {
         timeout: 2000
       });
       const url = result.result.value as string;
-      return url?.includes('perplexity.ai') || false;
+      return isTargetUrl(url);
     } catch {
       return false;
     }
+  }
+
+  /**
+   * CDP-level text insertion (works with Lexical/ProseMirror editors that ignore execCommand).
+   * Required for the sidecar's contenteditable, which is React-controlled.
+   */
+  async cdpInsertText(text: string): Promise<void> {
+    this.ensureConnected();
+    await (this.client as any).Input.insertText({ text });
+  }
+
+  /**
+   * Start a fresh sidecar conversation by clicking the "New thread" button.
+   * Sidecar's chat thread is keyed by URL (.../sidecar/search/<chat-id>); just
+   * navigating back to /sidecar doesn't reset the thread because the existing
+   * tab keeps its state in React. The button does both: clears the chat AND
+   * routes the URL back to /sidecar. Returns true if the button was clicked
+   * and the chat actually reset.
+   */
+  async startNewSidecarChat(): Promise<boolean> {
+    this.ensureConnected();
+    const r = await this.evaluate(`
+      (() => {
+        const btn = document.querySelector('button[aria-label*="New thread"]');
+        if (!btn) return false;
+        btn.click();
+        return true;
+      })()
+    `);
+    if (!r.result.value) return false;
+    // Wait for state to settle: URL back to plain /sidecar, prose-str count = 0
+    const start = Date.now();
+    while (Date.now() - start < 3000) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const check = await this.evaluate(`
+        (() => ({
+          urlClean: !window.location.pathname.includes('/search/'),
+          proseStrCount: document.querySelectorAll('[class*="prose-str"]').length,
+        }))()
+      `);
+      const v = check.result.value as { urlClean: boolean; proseStrCount: number };
+      if (v.urlClean && v.proseStrCount === 0) return true;
+    }
+    return true; // best-effort — button was clicked, even if state-settle check timed out
+  }
+
+  /**
+   * Wait for the sidecar's contenteditable input to be present and stable.
+   * Sidecar uses Lexical/React — after navigate, there's a window where the
+   * element exists but typing into it doesn't stick because React hasn't fully
+   * mounted. Loops a presence+bbox check until two consecutive identical reads.
+   */
+  async waitForInputReady(maxMs: number = 5000): Promise<boolean> {
+    const start = Date.now();
+    let lastBbox: string | null = null;
+    while (Date.now() - start < maxMs) {
+      const r = await this.evaluate(`
+        (() => {
+          const el = document.querySelector('[contenteditable="true"]');
+          if (!el) return null;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 50 || rect.height < 10) return null;
+          // Look for ancestor with aria-busy=true → React still mounting
+          let p = el.parentElement;
+          while (p) {
+            if (p.getAttribute('aria-busy') === 'true') return null;
+            p = p.parentElement;
+          }
+          return rect.x + ',' + rect.y + ',' + Math.round(rect.width) + ',' + Math.round(rect.height);
+        })()
+      `);
+      const bbox = r.result.value as string | null;
+      if (bbox && bbox === lastBbox) return true;
+      lastBbox = bbox;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    return false;
+  }
+
+  /**
+   * CDP-level Enter keypress (more authentic than synthetic KeyboardEvent for React inputs).
+   */
+  async cdpPressEnter(): Promise<void> {
+    this.ensureConnected();
+    await this.client!.Input.dispatchKeyEvent({
+      type: "keyDown", key: "Enter", code: "Enter",
+      windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+    });
+    await this.client!.Input.dispatchKeyEvent({
+      type: "keyUp", key: "Enter", code: "Enter",
+      windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+    });
   }
 
   // ============ TAB REGISTRY METHODS ============

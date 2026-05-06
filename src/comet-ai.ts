@@ -2,6 +2,7 @@
 // Handles sending prompts to Comet's AI assistant and reading responses
 
 import { cometClient } from "./cdp-client.js";
+import { TARGET } from "./target.js";
 
 // Input selectors - contenteditable div is primary for Perplexity
 const INPUT_SELECTORS = [
@@ -32,6 +33,12 @@ export class CometAI {
    * Send a prompt to Comet's AI (Perplexity)
    */
   async sendPrompt(prompt: string): Promise<string> {
+    // Sidecar uses a Lexical-style editor that ignores execCommand-based input —
+    // route through CDP Input.insertText + native key events instead.
+    if (TARGET === "sidecar") {
+      return this.sendPromptViaCDP(prompt);
+    }
+
     const inputSelector = await this.findInputElement();
 
     if (!inputSelector) {
@@ -67,6 +74,53 @@ export class CometAI {
 
     // Submit the prompt
     await this.submitPrompt();
+
+    return `Prompt sent: "${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}"`;
+  }
+
+  /**
+   * Sidecar-specific prompt submission via CDP-level Input methods.
+   * Sidecar's contenteditable is React-controlled (Lexical or similar) and
+   * does not respond to document.execCommand or synthetic KeyboardEvents.
+   * Probed empirically — see SIDECAR_FORK.md.
+   */
+  private async sendPromptViaCDP(prompt: string): Promise<string> {
+    // Find input — sidecar has exactly one [contenteditable="true"]
+    const hasInput = await cometClient.evaluate(`
+      (() => {
+        const el = document.querySelector('[contenteditable="true"]');
+        if (!el) return { ok: false };
+        el.focus();
+        return { ok: true };
+      })()
+    `);
+    if (!(hasInput.result.value as { ok: boolean })?.ok) {
+      throw new Error("Could not find sidecar input. Ensure Comet is on /sidecar.");
+    }
+
+    // Hard-clear (Lexical can resist single selectAll+delete; loop until empty or capped).
+    for (let i = 0; i < 15; i++) {
+      const remaining = await cometClient.evaluate(`
+        (() => {
+          const el = document.querySelector('[contenteditable="true"]');
+          el.focus();
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+          return el.innerText.length;
+        })()
+      `);
+      if ((remaining.result.value as number) <= 1) break;
+    }
+
+    // Refocus and inject text via CDP (OS-level, framework-agnostic)
+    await cometClient.evaluate(`document.querySelector('[contenteditable="true"]').focus()`);
+    await cometClient.cdpInsertText(prompt);
+
+    // Brief settle so Lexical commits the input to its internal state
+    await new Promise(resolve => setTimeout(resolve, 400));
+
+    // Submit via native Enter keypress at CDP level
+    await cometClient.cdpPressEnter();
 
     return `Prompt sent: "${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}"`;
   }
@@ -262,6 +316,8 @@ export class CometAI {
   resetStabilityTracking(): void {
     this.lastResponseText = '';
     this.stableResponseCount = 0;
+    this.sidecarLastResponse = '';
+    this.sidecarStableCount = 0;
   }
 
   /**
@@ -275,7 +331,12 @@ export class CometAI {
     hasStopButton: boolean;
     agentBrowsingUrl: string;
     isStable: boolean;
+    awaitingConsent?: boolean;
   }> {
+    if (TARGET === "sidecar") {
+      return this.getSidecarStatus();
+    }
+
     // Get browsing URL from agent's tab
     let agentBrowsingUrl = '';
     try {
@@ -494,6 +555,163 @@ export class CometAI {
     return {
       ...statusResult,
       agentBrowsingUrl,
+      isStable,
+    };
+  }
+
+  // Independent stability tracker for sidecar — lower threshold than main
+  // because sidecar answers can be very short (e.g. a single number).
+  private sidecarLastResponse: string = '';
+  private sidecarStableCount: number = 0;
+  private readonly SIDECAR_STABILITY_THRESHOLD: number = 2;
+
+  // Pre-submit count of answer-prose elements (those with class prose-str…).
+  // Used to ignore old conversation history when extracting the current turn's answer.
+  // Set by index.ts before calling sendPrompt — see setSidecarBaseline().
+  private sidecarBaseline: number = 0;
+
+  private isSidecarResponseStable(current: string): boolean {
+    if (!current || current.length < 2) return false;
+    if (current === this.sidecarLastResponse) {
+      this.sidecarStableCount++;
+    } else {
+      this.sidecarStableCount = 0;
+      this.sidecarLastResponse = current;
+    }
+    return this.sidecarStableCount >= this.SIDECAR_STABILITY_THRESHOLD;
+  }
+
+  /**
+   * Capture the count of answer-prose elements before submitting a new prompt.
+   * Sidecar accumulates conversation history in DOM; without a baseline we'd
+   * read the previous answer as "the current response" and immediately mark
+   * the task completed. Caller must invoke this just before sendPrompt.
+   */
+  async setSidecarBaseline(): Promise<number> {
+    const r = await cometClient.evaluate(`
+      document.querySelectorAll('[class*="prose-str"]').length
+    `);
+    this.sidecarBaseline = (r.result.value as number) || 0;
+    return this.sidecarBaseline;
+  }
+
+  /**
+   * Sidecar-specific status detector. Distinguishes answer prose (class includes
+   * `prose-str…`) from step-card prose (different chrome) by class name only —
+   * both share the generic `[class*="prose"]` selector but only answer turns
+   * carry the `prose-str…` modifier. Filtered by pre-submit baseline so old
+   * conversation history doesn't pollute the current turn's response.
+   *
+   * Also detects the "Let Assistant control your browser?" consent dialog and
+   * extracts visible step labels (Navigating/Clicking/etc.) as progress.
+   */
+  private async getSidecarStatus() {
+    const baseline = this.sidecarBaseline;
+    const result = await cometClient.safeEvaluate(`
+      (() => {
+        // Stop button (strongest "working" signal)
+        let hasActiveStopButton = false;
+        for (const btn of document.querySelectorAll('button')) {
+          const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+          const hasStopRect = btn.querySelector('svg rect') !== null;
+          if ((ariaLabel.includes('stop') || ariaLabel.includes('cancel') || hasStopRect) &&
+              btn.offsetParent !== null && !btn.disabled) {
+            hasActiveStopButton = true;
+            break;
+          }
+        }
+
+        const hasSpinner = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"]') !== null;
+
+        // Consent dialog — Comet's "Let Assistant control your browser?" guardrail
+        let awaitingConsent = false;
+        const bodyText = document.body.innerText;
+        if (/Let Assistant control your browser/i.test(bodyText) ||
+            /Allow Assistant to control/i.test(bodyText)) {
+          // Confirm an Allow-once button is actually clickable (not stale text)
+          for (const btn of document.querySelectorAll('button')) {
+            const t = (btn.innerText || '').trim().toLowerCase();
+            if (t === 'allow once' && btn.offsetParent !== null && !btn.disabled) {
+              awaitingConsent = true;
+              break;
+            }
+          }
+        }
+
+        // Answer prose: only [class*="prose-str"] elements (per probe — distinguishes
+        // answer turns from action-step prose like "Clicking", "Navigating")
+        const answerProse = [...document.querySelectorAll('[class*="prose-str"]')];
+        const totalAnswers = answerProse.length;
+        // New answers only (after pre-submit baseline)
+        const newAnswers = answerProse.slice(${baseline});
+        const responseFull = newAnswers.map(el => el.innerText.trim()).filter(t => t.length > 0).join('\\n\\n');
+
+        // Step labels for progress visibility — Comet's UI shows section headers
+        // for actions in progress: "Navigating", "Reading", "Clicking", "Interacting".
+        // These live in elements ahead of the answer prose. Scan recent body text.
+        const stepKeywords = ['Navigating', 'Reading', 'Clicking', 'Interacting', 'Searching', 'Analyzing', 'Opening', 'Reviewing', 'Preparing to assist', 'Typing'];
+        const recentSteps = [];
+        const lines = bodyText.split('\\n').map(l => l.trim()).filter(Boolean);
+        for (const line of lines) {
+          if (line.length > 80) continue;
+          for (const kw of stepKeywords) {
+            if (line === kw || line.startsWith(kw + ' ')) {
+              recentSteps.push(line.substring(0, 80));
+              break;
+            }
+          }
+        }
+        const uniqueSteps = [...new Set(recentSteps)].slice(-8);
+
+        let status = 'idle';
+        if (awaitingConsent) {
+          status = 'awaiting_consent';
+        } else if (hasActiveStopButton || hasSpinner) {
+          status = 'working';
+        } else if (responseFull.length > 0) {
+          // Promoted to 'completed' by stability check in caller
+          status = 'working';
+        }
+
+        return {
+          status,
+          response: responseFull,
+          hasActiveStopButton,
+          awaitingConsent,
+          totalAnswers,
+          newAnswerCount: newAnswers.length,
+          steps: uniqueSteps,
+          currentStep: uniqueSteps[uniqueSteps.length - 1] || '',
+        };
+      })()
+    `);
+
+    const r = result.result.value as {
+      status: "idle" | "working" | "awaiting_consent";
+      response: string;
+      hasActiveStopButton: boolean;
+      awaitingConsent: boolean;
+      totalAnswers: number;
+      newAnswerCount: number;
+      steps: string[];
+      currentStep: string;
+    };
+
+    const isStable = this.isSidecarResponseStable(r.response);
+
+    let status: "idle" | "working" | "completed" | "awaiting_consent" = r.status;
+    if (status !== "awaiting_consent" && isStable && r.response.length > 0 && !r.hasActiveStopButton) {
+      status = "completed";
+    }
+
+    return {
+      status: status as "idle" | "working" | "completed",
+      awaitingConsent: r.awaitingConsent,
+      steps: r.steps,
+      currentStep: r.currentStep,
+      response: r.response.substring(0, 8000),
+      hasStopButton: r.hasActiveStopButton,
+      agentBrowsingUrl: "",
       isStable,
     };
   }

@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { cometClient } from "./cdp-client.js";
 import { cometAI } from "./comet-ai.js";
+import { TARGET, TARGET_URL, isTargetUrl, pickTargetTab } from "./target.js";
 
 // Session state for tracking task progress and preventing stale responses
 interface SessionState {
@@ -164,7 +165,7 @@ const TOOLS: Tool[] = [
 ];
 
 const server = new Server(
-  { name: "comet-bridge", version: "2.5.0" },
+  { name: `comet-bridge-${TARGET}`, version: "2.6.2-sidecar.4" },
   { capabilities: { tools: {} } }
 );
 
@@ -181,29 +182,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Get all tabs - DON'T clean up tabs, as closing them can crash Comet
         const targets = await cometClient.listTargets();
-        const freshTargets = targets; // Use the same list, no cleanup
+        const freshTargets = targets;
 
-        // Prefer connecting to existing Perplexity tab, or any page tab
+        // Prefer existing tab matching the active TARGET (main vs sidecar)
+        const targetTab = freshTargets.find(t => t.type === 'page' && isTargetUrl(t.url));
+        // Fall back to any Perplexity tab, then any page
         const perplexityTab = freshTargets.find(t => t.type === 'page' && t.url.includes('perplexity.ai'));
-        const anyPage = perplexityTab || freshTargets.find(t => t.type === 'page');
+        const anyPage = targetTab || perplexityTab || freshTargets.find(t => t.type === 'page');
 
         if (anyPage) {
           await cometClient.connect(anyPage.id);
 
-          // Only navigate to Perplexity if not already there
-          if (!anyPage.url.includes('perplexity.ai')) {
-            await cometClient.navigate("https://www.perplexity.ai/", true);
+          // Navigate to TARGET_URL unless we're already on it
+          if (!isTargetUrl(anyPage.url)) {
+            await cometClient.navigate(TARGET_URL, true);
             await new Promise(resolve => setTimeout(resolve, 1500));
           }
 
-          return { content: [{ type: "text", text: `${startResult}\nConnected to Perplexity` }] };
+          return { content: [{ type: "text", text: `${startResult}\nConnected to Perplexity (target=${TARGET})` }] };
         }
 
-        // No tabs at all - create a new one
-        const newTab = await cometClient.newTab("https://www.perplexity.ai/");
-        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for page load
+        // No tabs at all - create one at TARGET_URL
+        const newTab = await cometClient.newTab(TARGET_URL);
+        await new Promise(resolve => setTimeout(resolve, 2000));
         await cometClient.connect(newTab.id);
-        return { content: [{ type: "text", text: `${startResult}\nCreated new tab and navigated to Perplexity` }] };
+        return { content: [{ type: "text", text: `${startResult}\nCreated new tab and navigated to Perplexity (target=${TARGET})` }] };
       }
 
       case "comet_ask": {
@@ -276,44 +279,75 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // For newChat: navigate to fresh Perplexity home (don't aggressively close tabs)
+        // For newChat: start a fresh conversation.
+        // Sidecar: navigate alone doesn't reset thread state (URL .../sidecar/search/<id> keeps
+        // its React conversation); click the "New thread" button instead — that resets the chat
+        // AND routes the URL back to plain /sidecar.
+        // Main app: navigate to home (upstream behaviour).
         if (newChat) {
-          // Ensure we're connected
           await cometClient.ensureConnection();
 
-          // Just navigate to Perplexity home for a fresh start
-          try {
-            await cometClient.navigate("https://www.perplexity.ai/", true);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-          } catch (navError) {
-            // If navigation fails, try to reconnect and retry
-            const targets = await cometClient.listTargets();
-            const mainTab = targets.find(t => t.type === 'page' && t.url.includes('perplexity'));
-            if (mainTab) {
-              await cometClient.connect(mainTab.id);
-            } else {
-              const anyPage = targets.find(t => t.type === 'page');
-              if (anyPage) {
-                await cometClient.connect(anyPage.id);
-                await cometClient.navigate("https://www.perplexity.ai/", true);
+          if (TARGET === "sidecar") {
+            // Make sure we're on the sidecar tab before clicking
+            try {
+              const tabs = await cometClient.listTabsCategorized();
+              if (tabs.sidecar) {
+                await cometClient.connect(tabs.sidecar.id);
+              } else {
+                await cometClient.navigate(TARGET_URL, true);
+              }
+            } catch {
+              await cometClient.navigate(TARGET_URL, true);
+            }
+            const reset = await cometClient.startNewSidecarChat();
+            if (!reset) {
+              // Button not present (e.g., already on a fresh chat) — fall back to navigate
+              await cometClient.navigate(TARGET_URL, true);
+            }
+            const ready = await cometClient.waitForInputReady(5000);
+            if (!ready) {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+          } else {
+            try {
+              await cometClient.navigate(TARGET_URL, true);
+            } catch (navError) {
+              const targets = await cometClient.listTargets();
+              const targetTab = targets.find(t => t.type === 'page' && isTargetUrl(t.url));
+              const fallback = targetTab || targets.find(t => t.type === 'page' && t.url.includes('perplexity'));
+              if (fallback) {
+                await cometClient.connect(fallback.id);
+                if (!isTargetUrl(fallback.url)) {
+                  await cometClient.navigate(TARGET_URL, true);
+                }
+              } else {
+                const anyPage = targets.find(t => t.type === 'page');
+                if (anyPage) {
+                  await cometClient.connect(anyPage.id);
+                  await cometClient.navigate(TARGET_URL, true);
+                }
               }
             }
-            await new Promise(resolve => setTimeout(resolve, 1500));
+            await new Promise(resolve => setTimeout(resolve, 2000));
           }
         } else {
-          // Not newChat - just ensure we're on Perplexity
+          // Not newChat - just ensure we're on the right target tab
           const tabs = await cometClient.listTabsCategorized();
-          if (tabs.main) {
-            await cometClient.connect(tabs.main.id);
+          const targetTab = pickTargetTab(tabs);
+          if (targetTab) {
+            await cometClient.connect(targetTab.id);
           }
 
           const urlResult = await cometClient.evaluate('window.location.href');
           const currentUrl = urlResult.result.value as string;
-          const isOnPerplexity = currentUrl?.includes('perplexity.ai');
 
-          if (!isOnPerplexity) {
-            await cometClient.navigate("https://www.perplexity.ai/", true);
-            await new Promise(resolve => setTimeout(resolve, 2000));
+          if (!isTargetUrl(currentUrl)) {
+            await cometClient.navigate(TARGET_URL, true);
+            if (TARGET === "sidecar") {
+              await cometClient.waitForInputReady(5000);
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            }
           }
         }
 
@@ -332,6 +366,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           })()
         `);
         const oldState = oldStateResult.result.value as { count: number; lastText: string };
+
+        // Sidecar: capture pre-submit count of answer-prose elements as baseline.
+        // Without this, accumulated conversation history is misread as the current
+        // turn's response, causing the polling loop to mark task COMPLETED instantly.
+        if (TARGET === "sidecar") {
+          await cometAI.setSidecarBaseline();
+        }
 
         // Send the prompt
         await cometAI.sendPrompt(prompt);
@@ -387,6 +428,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             const status = await cometAI.getAgentStatus();
             consecutiveErrors = 0; // Reset error count on success
+
+            // Sidecar consent dialog: agent paused waiting for user click.
+            // Comet sometimes flashes the dialog briefly before auto-resolving with a
+            // cached grant for the same domain — wait 3s and re-check before bailing,
+            // so we don't false-positive on transient dialogs the user never saw.
+            if (status.awaitingConsent) {
+              await new Promise(resolve => setTimeout(resolve, 3000));
+              const recheck = await cometAI.getAgentStatus();
+              if (recheck.awaitingConsent) {
+                sessionState.steps = stepsCollected;
+                return { content: [{ type: "text", text:
+                  `Agent paused: Comet is asking for your permission to control the browser ` +
+                  `("Let Assistant control your browser?" dialog). ` +
+                  `Click "Allow once" in the Comet window (port 9223) to proceed, then call comet_poll. ` +
+                  `If you don't want to grant access, call comet_stop.`
+                }] };
+              }
+              // Auto-resolved — continue normal polling
+            }
 
             // Track activity - if response changed, update activity time
             if (status.response !== previousResponse) {
@@ -490,17 +550,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "Status: IDLE\nPrevious task session expired. Use comet_ask to start a new task." }] };
         }
 
-        // If task was already completed, return the cached response
+        // If task was already completed, return the cached response — but for sidecar,
+        // first verify the live DOM agrees (premature completion was a real bug we hit;
+        // see SIDECAR_FORK.md "Known limitations"). If stop button is still present,
+        // the cache lied — re-activate session and fall through to live-status path.
         if (!sessionState.isActive && sessionState.lastResponse) {
-          const timeSinceComplete = sessionState.lastResponseTime
-            ? Math.round((Date.now() - sessionState.lastResponseTime) / 1000)
-            : 0;
-          return { content: [{ type: "text", text: `Status: COMPLETED (${timeSinceComplete}s ago)\n\n${sessionState.lastResponse}` }] };
+          if (TARGET === "sidecar") {
+            try {
+              await cometClient.ensureOnPerplexityTab();
+              const liveStatus = await cometAI.getAgentStatus();
+              if (liveStatus.hasStopButton || liveStatus.awaitingConsent) {
+                // Cache was wrong; reactivate session
+                sessionState.isActive = true;
+                sessionState.lastResponse = null;
+                sessionState.lastResponseTime = null;
+              } else {
+                const timeSinceComplete = sessionState.lastResponseTime
+                  ? Math.round((Date.now() - sessionState.lastResponseTime) / 1000)
+                  : 0;
+                // Prefer the live response if it's longer (agent kept producing after we cached)
+                const responseToShow = liveStatus.response.length > sessionState.lastResponse.length
+                  ? liveStatus.response
+                  : sessionState.lastResponse;
+                return { content: [{ type: "text", text: `Status: COMPLETED (${timeSinceComplete}s ago)\n\n${responseToShow}` }] };
+              }
+            } catch {
+              // Live query failed; fall back to cache
+              const timeSinceComplete = sessionState.lastResponseTime
+                ? Math.round((Date.now() - sessionState.lastResponseTime) / 1000)
+                : 0;
+              return { content: [{ type: "text", text: `Status: COMPLETED (${timeSinceComplete}s ago)\n\n${sessionState.lastResponse}` }] };
+            }
+          } else {
+            const timeSinceComplete = sessionState.lastResponseTime
+              ? Math.round((Date.now() - sessionState.lastResponseTime) / 1000)
+              : 0;
+            return { content: [{ type: "text", text: `Status: COMPLETED (${timeSinceComplete}s ago)\n\n${sessionState.lastResponse}` }] };
+          }
         }
 
         // Active task - get fresh status from Perplexity
         await cometClient.ensureOnPerplexityTab();
         const status = await cometAI.getAgentStatus();
+
+        // Sidecar consent dialog — user needs to click Allow once
+        if (status.awaitingConsent) {
+          return { content: [{ type: "text", text:
+            `Status: AWAITING_CONSENT\nComet is asking permission to control the browser. ` +
+            `Click "Allow once" in the Comet window (port 9223), then poll again. ` +
+            `Or call comet_stop to abort.`
+          }] };
+        }
 
         // If completed, update session state and return response
         if (status.status === 'completed' && status.response) {
@@ -615,6 +715,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "comet_mode": {
+        if (TARGET === "sidecar") {
+          return { content: [{ type: "text", text: "comet_mode is unavailable when COMET_TARGET=sidecar. The Comet Assistant sidecar has no Search/Research/Labs/Learn toggles — use slash-shortcuts inside the prompt instead (e.g. '/search ...'). Restart the MCP with COMET_TARGET=main to use mode switching." }] };
+        }
+
         const mode = args?.mode as string | undefined;
 
         // If no mode provided, show current mode
